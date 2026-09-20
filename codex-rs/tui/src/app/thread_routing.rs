@@ -825,6 +825,63 @@ impl App {
                     }
                 }
                 if should_start_turn {
+                    let routed = crate::turn_router::route_idle_turn(
+                        thread_id,
+                        items,
+                        cwd,
+                        model,
+                        effort.as_ref(),
+                        collaboration_mode.as_ref(),
+                    )
+                    .await;
+                    if let Some(notice) = routed.as_ref().and_then(|route| route.notice.as_ref()) {
+                        self.chat_widget
+                            .add_info_message(notice.clone(), /*hint*/ None);
+                    }
+                    let (turn_model, turn_effort, turn_collaboration_mode) = routed
+                        .as_ref()
+                        .and_then(|route| {
+                            let (model, effort) = route.validated_route()?;
+                            let prior = collaboration_mode
+                                .as_ref()
+                                .and_then(|mode| mode.settings.developer_instructions.as_deref())
+                                .map(crate::turn_router::without_host_router_contract)
+                                .unwrap_or_default();
+                            let contract =
+                                route.developer_instructions.as_deref().unwrap_or_default();
+                            let instructions = match (prior.is_empty(), contract.is_empty()) {
+                                (true, true) => None,
+                                (false, true) => Some(prior.to_string()),
+                                (true, false) => Some(contract.to_string()),
+                                (false, false) => Some(format!("{prior}\n{contract}")),
+                            };
+                            let base = collaboration_mode.clone().unwrap_or_else(|| {
+                                codex_protocol::config_types::CollaborationMode {
+                                    mode: codex_protocol::config_types::ModeKind::Default,
+                                    settings: codex_protocol::config_types::Settings {
+                                        model: model.to_string(),
+                                        reasoning_effort: Some(effort.clone()),
+                                        developer_instructions: None,
+                                    },
+                                }
+                            });
+                            Some((
+                                model.to_string(),
+                                Some(effort.clone()),
+                                Some(base.with_updates(
+                                    Some(model.to_string()),
+                                    Some(Some(effort.clone())),
+                                    Some(instructions),
+                                )),
+                            ))
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                model.to_string(),
+                                effort.clone(),
+                                collaboration_mode.clone(),
+                            )
+                        });
                     let eligible_account = self.chat_widget.has_chatgpt_account()
                         && self.chat_widget.config_ref().model_provider_id == "openai";
                     let enabled = self.chat_widget.daybreak_enabled
@@ -832,12 +889,18 @@ impl App {
                         && !self.side_threads.contains_key(&thread_id);
                     let cyber_access_program = match crate::daybreak::program_for_turn(
                         &self.chat_widget.model_catalog().models,
-                        model,
+                        &turn_model,
                         eligible_account,
                         enabled,
                     ) {
                         Ok(program) => program,
                         Err(message) => {
+                            if let Some(record_token) = routed
+                                .as_ref()
+                                .and_then(|decision| decision.record_token.as_deref())
+                            {
+                                crate::turn_router::abort_turn_start(record_token).await;
+                            }
                             if !self
                                 .chat_widget
                                 .handle_turn_start_rejection(message.clone())
@@ -906,15 +969,38 @@ impl App {
                             turn_approvals_reviewer,
                             permissions_override,
                             config.permissions.user_visible_workspace_roots(),
-                            model.to_string(),
-                            effort.clone(),
+                            turn_model,
+                            turn_effort,
                             *summary,
                             service_tier.clone(),
-                            collaboration_mode.clone(),
+                            turn_collaboration_mode,
                             final_output_json_schema.clone(),
                             cyber_access_program.map(Into::into),
                         )
-                        .await?;
+                        .await;
+                    let response = match response {
+                        Ok(response) => response,
+                        Err(error) => {
+                            if let Some(record_token) = routed
+                                .as_ref()
+                                .and_then(|decision| decision.record_token.as_deref())
+                            {
+                                crate::turn_router::abort_turn_start(record_token).await;
+                            }
+                            return Err(error);
+                        }
+                    };
+                    if let Some(record_token) = routed
+                        .as_ref()
+                        .and_then(|decision| decision.record_token.as_deref())
+                    {
+                        crate::turn_router::bind_turn_start(
+                            record_token,
+                            thread_id,
+                            &response.turn.id,
+                        )
+                        .await;
+                    }
                     if self.active_thread_id == Some(thread_id)
                         && self.chat_widget.thread_id() == Some(thread_id)
                     {
@@ -1174,6 +1260,9 @@ impl App {
         notification: ServerNotification,
     ) -> Result<()> {
         self.deliver_background_voice_notification(thread_id, &notification);
+        if let ServerNotification::TurnCompleted(completed) = &notification {
+            crate::turn_router::record_turn_completion(thread_id, &completed.turn);
+        }
         if self.abandoned_side_threads.contains(&thread_id) {
             return Ok(());
         }
